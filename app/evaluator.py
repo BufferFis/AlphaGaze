@@ -3,11 +3,13 @@ import os
 import numpy as np
 import pandas as pd
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix, mean_absolute_error, mean_squared_error
-from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import LabelEncoder
 import yfinance as yf
 from prophet import Prophet
+
+from rl_agent import train_agent, predict_signal
+from rl_env import SIGNAL_MAP
 
 from predictor import _finbert_model, _finbert_tokenizer, _load_finbert, _score_headlines, FEATURE_COLS, BUY_THRESHOLD, SELL_THRESHOLD
 
@@ -62,14 +64,17 @@ def evaluate_pipeline(symbol: str):
     le = LabelEncoder()
     y_class = le.fit_transform(df["signal"])
     
-    cv = TimeSeriesSplit(n_splits=5)
-    all_preds, all_true = [], []
-    for train_idx, test_idx in cv.split(X):
-        clf = RandomForestClassifier(n_estimators=100, max_depth=6, class_weight="balanced", random_state=42)
-        clf.fit(X[train_idx], y_class[train_idx])
-        preds = clf.predict(X[test_idx])
-        all_preds.extend(preds)
-        all_true.extend(y_class[test_idx])
+    # Train RL agent
+    rl_model = train_agent(df, total_timesteps=20_000, seed=42)
+
+    # Evaluate by running agent on the dataset
+    all_preds = []
+    all_true = list(y_class)
+    for i in range(len(df)):
+        row = df.iloc[[i]]
+        obs = row[FEATURE_COLS].values.flatten()
+        result = predict_signal(rl_model, obs)
+        all_preds.append(SIGNAL_MAP.get(result["signal"], 1))
         
     accuracy = accuracy_score(all_true, all_preds)
     precision, recall, f1, _ = precision_recall_fscore_support(all_true, all_preds, average="macro", zero_division=0)

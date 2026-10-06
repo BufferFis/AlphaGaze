@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Stock Signal — Prophet + FinBERT + XAI</title>
+  <title>Stock Signal — Prophet + FinBERT + PPO RL</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet"/>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
   <style>
@@ -212,7 +212,7 @@
   <!-- Loading spinner -->
   <div id="spinner" class="text-center py-5">
     <div class="spinner-border" style="color:var(--accent); width:3rem; height:3rem;" role="status"></div>
-    <p class="mt-3" style="color:var(--muted);">Running Prophet + FinBERT + SHAP pipeline…<br>
+    <p class="mt-3" style="color:var(--muted);">Running Prophet + FinBERT + PPO RL pipeline…<br>
     <small>First run may take ~2 min (FinBERT inference)</small></p>
   </div>
 
@@ -269,11 +269,11 @@
       </div>
       <div class="col-md-6">
         <div class="card p-4 h-100">
-          <div class="section-title">SHAP — Feature Impact on Prediction</div>
+          <div class="section-title">PPO Policy — Feature Impact on Action</div>
           <div class="shap-wrap">
             <canvas id="shapChart"></canvas>
           </div>
-          <p class="f1-note mt-2">Positive SHAP = pushes toward predicted signal.<br>Negative SHAP = pushes against it.</p>
+          <p class="f1-note mt-2">Positive impact = pushes policy toward action.<br>Negative impact = reduces action probability.<br><small>Computed via policy perturbation analysis</small></p>
         </div>
       </div>
     </div>
@@ -405,11 +405,11 @@ function renderResults(d) {
   box.className = `signal-box signal-${sig}`;
   renderUncertainty(d.uncertainty);
 
-  // F1 note
+  // F1 / Model note
   document.getElementById('f1Note').textContent =
     d.cv_weighted_f1 != null
       ? `CV Weighted F1: ${(d.cv_weighted_f1 * 100).toFixed(1)}%  (TimeSeriesSplit)`
-      : 'F1: insufficient data for CV';
+      : 'Policy: PPO Reinforcement Learning Agent';
 
   // Stats row
   const stats = [
@@ -446,7 +446,7 @@ function renderResults(d) {
     }
   });
 
-  // SHAP chart
+  // Feature Importance chart
   const shap    = d.shap_values;
   const sLabels = Object.keys(shap).map(k => k.replace(/_/g,' '));
   const sVals   = Object.values(shap).map(v => +v.toFixed(5));
@@ -464,7 +464,7 @@ function renderResults(d) {
     options: {
       indexAxis: 'y',
       plugins: { legend: { display: false },
-                 tooltip: { callbacks: { label: ctx => ` SHAP: ${ctx.parsed.x.toFixed(5)}` } } },
+                 tooltip: { callbacks: { label: ctx => ` Impact: ${ctx.parsed.x.toFixed(5)}` } } },
       scales: {
         x: { ticks: { color: '#8b949e' }, grid: { color: '#30363d' } },
         y: { ticks: { color: '#e6edf3', font: { size: 11 } }, grid: { display: false } }

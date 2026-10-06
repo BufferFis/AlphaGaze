@@ -11,6 +11,7 @@ Results are cached in-memory for CACHE_TTL seconds to avoid
 re-running the full pipeline on every request.
 """
 
+import os
 import time
 import warnings
 import re
@@ -29,6 +30,8 @@ from sklearn.preprocessing import LabelEncoder
 from transformers import BertForSequenceClassification, BertTokenizer
 
 from scraper import scrape_news, STOCK_QUERIES
+from rl_agent import train_agent, predict_signal, compute_feature_importance, load_agent
+from rl_env import ACTION_MAP
 
 warnings.filterwarnings("ignore")
 
@@ -59,6 +62,8 @@ SUPPORTED_STOCKS = {
     "SBIN.NS":       "SBI",
     "BHARTIARTL.NS": "Bharti Airtel",
 }
+
+PRETRAINED_MODEL_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "ppo_pretrained")
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Lazy-loaded FinBERT (shared across all stocks, loaded once)
@@ -463,62 +468,54 @@ def _counterfactual_headline_tests(attention_maps: list[dict], max_items: int = 
     return tests
 
 
-def _rolling_backtest(merged_df: pd.DataFrame, n_points: int = 90, min_train: int = 40) -> dict:
-    """Run walk-forward backtest using only information available at each date."""
-    if merged_df is None or len(merged_df) < (min_train + 5):
+def _rolling_backtest(merged_df: pd.DataFrame, n_points: int = 90,
+                      min_train: int = 20) -> dict:
+    """Run walk-forward backtest using PPO RL agent."""
+    if merged_df is None or len(merged_df) < 12:
         return {
-            "summary": {
-                "samples": 0,
-                "accuracy": None,
-                "avg_confidence": None,
-            },
+            "summary": {"samples": 0, "accuracy": None, "avg_confidence": None},
             "series": [],
             "bucket_hit_rate": [],
         }
 
     df = merged_df.sort_values("ds").reset_index(drop=True)
+    effective_min_train = min(min_train, max(10, len(df) // 2))
     records = []
 
-    for i in range(min_train, len(df)):
-        train = df.iloc[:i]
+    pretrained_path = PRETRAINED_MODEL_PATH + ".zip"
+    base_model = load_agent(PRETRAINED_MODEL_PATH) if os.path.exists(pretrained_path) else None
+
+    for i in range(effective_min_train, len(df)):
+        train_data = df.iloc[:i].copy()
         test_row = df.iloc[[i]]
 
-        x_train = train[FEATURE_COLS].values
-        y_train = train["signal"].values
-        x_test = test_row[FEATURE_COLS].values
-
-        if len(np.unique(y_train)) < 2:
+        if len(train_data) < 5:
             continue
 
-        clf = RandomForestClassifier(
-            n_estimators=250,
-            max_depth=6,
-            class_weight="balanced",
-            random_state=42,
-        )
-        clf.fit(x_train, y_train)
+        try:
+            # Fast fine-tuning on historical window
+            agent = train_agent(train_data, total_timesteps=1000, seed=42, pretrained_model=base_model)
 
-        pred = str(clf.predict(x_test)[0])
-        proba = clf.predict_proba(x_test)[0]
-        confidence = float(np.max(proba))
-        actual = str(test_row["signal"].iloc[0])
+            obs = test_row[FEATURE_COLS].values.flatten()
+            result = predict_signal(agent, obs)
+            pred = result["signal"]
+            confidence = max(result["probabilities"].values())
+            actual = str(test_row["signal"].iloc[0])
 
-        records.append({
-            "date": str(test_row["ds"].iloc[0].date()),
-            "predicted": pred,
-            "actual": actual,
-            "correct": pred == actual,
-            "confidence": round(confidence, 4),
-            "next_return": round(float(test_row["next_return"].iloc[0]), 6),
-        })
+            records.append({
+                "date": str(test_row["ds"].iloc[0].date()),
+                "predicted": pred,
+                "actual": actual,
+                "correct": pred == actual,
+                "confidence": round(confidence, 4),
+                "next_return": round(float(test_row["next_return"].iloc[0]), 6),
+            })
+        except Exception:
+            continue
 
     if not records:
         return {
-            "summary": {
-                "samples": 0,
-                "accuracy": None,
-                "avg_confidence": None,
-            },
+            "summary": {"samples": 0, "accuracy": None, "avg_confidence": None},
             "series": [],
             "bucket_hit_rate": [],
         }
@@ -527,11 +524,7 @@ def _rolling_backtest(merged_df: pd.DataFrame, n_points: int = 90, min_train: in
     correct = np.array([1 if r["correct"] else 0 for r in records], dtype=float)
     conf = np.array([r["confidence"] for r in records], dtype=float)
 
-    buckets = {
-        "low": (0.0, 0.50),
-        "mid": (0.50, 0.67),
-        "high": (0.67, 1.01),
-    }
+    buckets = {"low": (0.0, 0.50), "mid": (0.50, 0.67), "high": (0.67, 1.01)}
     bucket_rows = []
     for name, (lo, hi) in buckets.items():
         idx = [i for i, c in enumerate(conf) if lo <= c < hi]
@@ -540,9 +533,7 @@ def _rolling_backtest(merged_df: pd.DataFrame, n_points: int = 90, min_train: in
             continue
         hit_rate = float(np.mean(correct[idx]))
         bucket_rows.append({
-            "bucket": name,
-            "samples": len(idx),
-            "hit_rate": round(hit_rate, 4),
+            "bucket": name, "samples": len(idx), "hit_rate": round(hit_rate, 4),
         })
 
     return {
@@ -584,7 +575,7 @@ def predict(symbol: str) -> dict:
 
     # ── 1. Price data ────────────────────────────────────────────────────────
     end_date   = datetime.now()
-    start_date = end_date - timedelta(days=365)
+    start_date = end_date - timedelta(days=730)  # 2 years for richer RL training
 
     raw = yf.download(
         symbol, start=start_date.strftime("%Y-%m-%d"),
@@ -655,58 +646,39 @@ def predict(symbol: str) -> dict:
     print(f"[predictor] {symbol}: {len(merged)} samples, "
           f"classes: {merged['signal'].value_counts().to_dict()}")
 
-    # ── 5. Train classifier ──────────────────────────────────────────────────
-    X       = merged[FEATURE_COLS].values
-    le      = LabelEncoder()
-    y       = le.fit_transform(merged["signal"].values)
-    classes = le.classes_
+    # ── 5. Train RL agent ────────────────────────────────────────────────────
+    pretrained_path = PRETRAINED_MODEL_PATH + ".zip"
+    pretrained = load_agent(PRETRAINED_MODEL_PATH) if os.path.exists(pretrained_path) else None
 
-    # CV evaluation (only if enough samples)
+    if pretrained is not None:
+        print(f"[predictor] {symbol}: Fine-tuning pre-trained PPO on {len(merged)} samples …")
+        rl_model = train_agent(merged, total_timesteps=10_000, seed=42,
+                               pretrained_model=pretrained)
+    else:
+        print(f"[predictor] {symbol}: No pre-trained model. Training PPO from scratch on {len(merged)} samples …")
+        rl_model = train_agent(merged, total_timesteps=50_000, seed=42)
+
+    # ── 6. RL Prediction ────────────────────────────────────────────────────
+    latest_row = merged.iloc[[-1]]
+    X_live = latest_row[FEATURE_COLS].values.flatten()
+
+    rl_result = predict_signal(rl_model, X_live)
+    pred_label = rl_result["signal"]
+    proba_dict = rl_result["probabilities"]
+
+    # ── 7. Feature Importance (replaces SHAP) ───────────────────────────────
+    print(f"[predictor] {symbol}: computing feature importance …")
+    shap_dict = compute_feature_importance(rl_model, X_live)
+
+    # CV F1 is no longer applicable for RL
     cv_f1 = None
-    if len(merged) >= 30:
-        tscv = TimeSeriesSplit(n_splits=min(5, len(merged) // 10))
-        all_preds, all_true = [], []
-        for train_idx, test_idx in tscv.split(X):
-            clf = RandomForestClassifier(
-                n_estimators=300, max_depth=6,
-                class_weight="balanced", random_state=42,
-            )
-            clf.fit(X[train_idx], y[train_idx])
-            preds = clf.predict(X[test_idx])
-            all_preds.extend(preds)
-            all_true.extend(y[test_idx])
-        cv_f1 = round(f1_score(all_true, all_preds, average="weighted", zero_division=0), 4)
-
-    # Final model on all data
-    final_clf = RandomForestClassifier(
-        n_estimators=300, max_depth=6,
-        class_weight="balanced", random_state=42,
-    )
-    final_clf.fit(X, y)
-
-    # ── 6. SHAP ──────────────────────────────────────────────────────────────
-    feature_df  = pd.DataFrame(X, columns=FEATURE_COLS)
-    explainer   = shap.TreeExplainer(final_clf)
-    shap_vals   = explainer.shap_values(feature_df)    # (n, p, c)
-
-    # Mean absolute SHAP per feature for the predicted class
-    latest_row   = merged.iloc[[-1]]
-    X_live       = latest_row[FEATURE_COLS].values
-    pred_enc     = final_clf.predict(X_live)[0]
-    pred_label   = le.inverse_transform([pred_enc])[0]
-    proba        = final_clf.predict_proba(X_live)[0]
-    proba_dict   = {cls: round(float(p), 4) for cls, p in zip(classes, proba)}
-
-    pred_class_idx = int(pred_enc)
-    shap_latest    = shap_vals[-1, :, pred_class_idx]          # shape (n_features,)
-    shap_dict      = {f: round(float(v), 6) for f, v in zip(FEATURE_COLS, shap_latest)}
 
     prophet_yhat  = float(merged.iloc[-1]["yhat"])
     latest_sent   = float(merged.iloc[-1]["sentiment_1d"])
     latest_date   = str(merged.iloc[-1]["ds"].date())
     uncertainty_summary = _compute_uncertainty_summary(proba_dict, latest_row, latest_sent)
 
-    # ── 7. BERT Attention maps for top headlines ─────────────────────────────
+    # ── 8. BERT Attention maps for top headlines ─────────────────────────────
     # Pick the most impactful headlines (highest abs sentiment)
     sent_articles = sorted(articles, key=lambda a: abs(a.get("sentiment", 0)), reverse=True)
     top_headlines = [a["title"] for a in sent_articles[:8]]
@@ -715,12 +687,12 @@ def predict(symbol: str) -> dict:
     attention_keywords = _aggregate_attention_keywords(attention_maps, top_k=12)
     counterfactual_tests = _counterfactual_headline_tests(attention_maps, max_items=3)
 
-    # ── 8. Prophet GradCAM-like sensitivity analysis ─────────────────────────
+    # ── 9. Prophet GradCAM-like sensitivity analysis ─────────────────────────
     print(f"[predictor] {symbol}: running Prophet sensitivity analysis …")
     prophet_sensitivity = _prophet_sensitivity(prices, m, forecast, n_segments=10)
 
     print(f"[predictor] {symbol}: running rolling backtest …")
-    rolling_backtest = _rolling_backtest(merged, n_points=90, min_train=40)
+    rolling_backtest = _rolling_backtest(merged, n_points=90, min_train=60)
 
     result = {
         "symbol":        symbol,

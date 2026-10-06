@@ -22,8 +22,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import shap
 
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import (
     classification_report,
     f1_score,
@@ -31,6 +29,9 @@ from sklearn.metrics import (
     ConfusionMatrixDisplay,
 )
 from sklearn.preprocessing import LabelEncoder
+
+from rl_agent import train_agent, predict_signal, compute_feature_importance, save_agent
+from rl_env import ACTION_MAP, SIGNAL_MAP
 
 warnings.filterwarnings("ignore")
 
@@ -136,33 +137,28 @@ def run_combine_and_xai():
         print("[ERROR] Not enough samples to train. Check date alignment.")
         return
 
-    # ── 4. TimeSeriesSplit cross-validation ─────────────────────────────────
-    print("\n[3/5] Training with TimeSeriesSplit (5-fold) CV...")
-    X        = merged[FEATURE_COLS].values
-    le       = LabelEncoder()
-    y        = le.fit_transform(merged["signal"].values)
-    classes  = le.classes_          # e.g. ['BUY', 'HOLD', 'SELL']
+    # ── 4. Train PPO RL Agent ───────────────────────────────────────────────
+    print("\n[3/5] Training PPO RL agent...")
+    X = merged[FEATURE_COLS].values
+    le = LabelEncoder()
+    y = le.fit_transform(merged["signal"].values)
+    classes = le.classes_
 
-    tscv              = TimeSeriesSplit(n_splits=5)
-    all_preds, all_true = [], []
+    rl_model = train_agent(merged, total_timesteps=50_000, seed=42)
 
-    for fold, (train_idx, test_idx) in enumerate(tscv.split(X), 1):
-        clf = RandomForestClassifier(
-            n_estimators=300,
-            max_depth=6,
-            class_weight="balanced",
-            random_state=42,
-        )
-        clf.fit(X[train_idx], y[train_idx])
-        preds = clf.predict(X[test_idx])
-        all_preds.extend(preds)
-        all_true.extend(y[test_idx])
-        fold_f1 = f1_score(y[test_idx], preds, average="weighted", zero_division=0)
-        print(f"    Fold {fold} — weighted F1 = {fold_f1:.4f}  (n_test={len(test_idx)})")
+    # Evaluate by running the agent over the entire dataset
+    all_preds = []
+    all_true = []
+    for i in range(len(merged)):
+        row = merged.iloc[[i]]
+        obs = row[FEATURE_COLS].values.flatten()
+        result = predict_signal(rl_model, obs)
+        all_preds.append(SIGNAL_MAP.get(result["signal"], 1))
+        all_true.append(y[i])
 
     overall_f1 = f1_score(all_true, all_preds, average="weighted", zero_division=0)
-    macro_f1   = f1_score(all_true, all_preds, average="macro",    zero_division=0)
-    print(f"\n    ── Weighted F1 (CV): {overall_f1:.4f}  |  Macro F1: {macro_f1:.4f} ──")
+    macro_f1 = f1_score(all_true, all_preds, average="macro", zero_division=0)
+    print(f"\n    ── Weighted F1: {overall_f1:.4f}  |  Macro F1: {macro_f1:.4f} ──")
     print("\n    Full Classification Report:")
     print(classification_report(all_true, all_preds,
                                 target_names=classes, zero_division=0))
@@ -174,66 +170,40 @@ def run_combine_and_xai():
     ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=classes).plot(
         ax=ax, colorbar=False, cmap="Blues"
     )
-    ax.set_title(f"Confusion Matrix — CV  (Weighted F1={overall_f1:.3f})")
+    ax.set_title(f"Confusion Matrix — PPO RL (Weighted F1={overall_f1:.3f})")
     plt.tight_layout()
     plt.savefig("results/confusion_matrix.png", dpi=150)
     plt.close()
     print("    Confusion matrix → results/confusion_matrix.png")
 
-    # ── 5. Final model on full data ─────────────────────────────────────────
-    print("\n[4/5] Fitting final model on full data (for SHAP + live signal)...")
-    final_clf = RandomForestClassifier(
-        n_estimators=300, max_depth=6,
-        class_weight="balanced", random_state=42,
-    )
-    final_clf.fit(X, y)
+    # ── 5. Feature Importance (replaces SHAP) ──────────────────────────────
+    print("\n[4/5] Computing feature importance...")
 
-    feature_df  = pd.DataFrame(X, columns=FEATURE_COLS)
-    explainer   = shap.TreeExplainer(final_clf)
-    shap_values = explainer.shap_values(feature_df)   # (n_samples, n_features, n_classes)
+    latest = merged.iloc[[-1]]
+    X_live = latest[FEATURE_COLS].values.flatten()
+    importance = compute_feature_importance(rl_model, X_live)
 
-    buy_idx = list(classes).index("BUY")
-
-    # Bar summary — list of (n, p) slices, one per class
-    shap_per_class = [shap_values[:, :, i] for i in range(len(classes))]
-
-    plt.figure(figsize=(10, 6))
-    shap.summary_plot(shap_per_class, feature_df,
-                      class_names=classes.tolist(),
-                      plot_type="bar", show=False)
-    plt.title("SHAP Feature Importance — Buy / Hold / Sell")
+    # Generate feature importance bar chart (replaces SHAP summary plot)
+    fig, ax = plt.subplots(figsize=(10, 6))
+    features = list(importance.keys())
+    values = list(importance.values())
+    colors = ['#3fb950' if v >= 0 else '#f85149' for v in values]
+    ax.barh(features, values, color=colors)
+    ax.set_title("Feature Importance — PPO RL Agent (Perturbation-Based)")
+    ax.set_xlabel("Impact on Action Probability")
     plt.tight_layout()
-    plt.savefig("results/shap_summary_plot.png", dpi=150)
+    plt.savefig("results/feature_importance.png", dpi=150)
     plt.close()
-    print("    SHAP summary    → results/shap_summary_plot.png")
+    print("    Feature importance → results/feature_importance.png")
 
-    # Beeswarm for the BUY class
-    shap_buy = shap_values[:, :, buy_idx]   # (n, p)
-    plt.figure(figsize=(10, 5))
-    shap.summary_plot(shap_buy, feature_df, show=False)
-    plt.title("SHAP BUY-class: how each feature pushes towards BUY")
-    plt.tight_layout()
-    plt.savefig("results/shap_beeswarm_buy.png", dpi=150)
-    plt.close()
-    print("    SHAP beeswarm   → results/shap_beeswarm_buy.png")
-
-    # Sentiment dependence on BUY
-    plt.figure(figsize=(10, 5))
-    shap.dependence_plot("sentiment_1d", shap_buy, feature_df, show=False)
-    plt.title("SHAP Dependence: Sentiment → BUY probability")
-    plt.tight_layout()
-    plt.savefig("results/shap_dependence_sentiment_buy.png", dpi=150)
-    plt.close()
-    print("    SHAP dependence → results/shap_dependence_sentiment_buy.png")
+    # Save the model
+    save_agent(rl_model, "results/ppo_trading_agent")
 
     # ── 6. Live signal for the latest row ───────────────────────────────────
     print("\n[5/5] Generating live trade signal for latest date...")
-    latest      = merged.iloc[[-1]]
-    X_live      = latest[FEATURE_COLS].values
-    pred_enc    = final_clf.predict(X_live)[0]
-    pred_label  = le.inverse_transform([pred_enc])[0]
-    proba       = final_clf.predict_proba(X_live)[0]
-    proba_dict  = dict(zip(classes, proba))
+    rl_result = predict_signal(rl_model, X_live)
+    pred_label = rl_result["signal"]
+    proba_dict = rl_result["probabilities"]
 
     latest_date     = pd.Timestamp(latest["ds"].values[0]).date()
     latest_price    = float(latest["y"].values[0])
